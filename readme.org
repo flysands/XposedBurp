@@ -1,0 +1,315 @@
+#+LATEX_HEADER: \usepackage{fontspec}
+#+LATEX_HEADER: \setmainfont{Songti SC}
+#+STARTUP: indent
+#+STARTUP: hidestars
+#+OPTIONS: ^:nil toc:nil
+#+JEKYLL_CATEGORIES: android
+#+JEKYLL_TAGS: android xposed
+#+JEKYLL_COMMENTS: true
+#+TITLE: Xposed学习-插件开发（二）
+
+#+begin_quote
+上一篇文章讲述了Xposed的基本知识和如何开发一个简单的插件，本文将从自己在工作中碰到的实际问题入手。展示如何对金融级客户端进行抓包测试，为了客户隐私，我用自己写的Demo客户端作为演示。
+#+end_quote
+
+* 遇到的问题
+对apk进行抓包测试的时候，经常碰到很多apk与服务器交互都是经过加密处理。我模拟了一个https的加密请求，如下图所示。
+[[file:images/http-encrypt.png]]
+模拟apk为mockapp，主要功能就是在按钮事件处理函数中通过http post访问 *www.baidu.com* ，并在post body中写入ASE加密数据。主体代码如下：
+#+begin_src java
+  package com.flysands.mockapp;
+
+  import android.os.Bundle;
+  import android.support.v7.app.AppCompatActivity;
+  import android.util.Log;
+  import android.view.View;
+  import android.widget.Button;
+
+  import butterknife.BindView;
+  import butterknife.ButterKnife;
+  import retrofit2.Call;
+  import retrofit2.Callback;
+  import retrofit2.Response;
+  import retrofit2.Retrofit;
+  import retrofit2.converter.gson.GsonConverterFactory;
+
+  public class MainActivity extends AppCompatActivity {
+
+      public static final String TAG = "test-mockapp";
+
+      @BindView(R.id.req)
+      public Button req;
+
+      @Override
+      protected void onCreate(Bundle savedInstanceState) {
+          super.onCreate(savedInstanceState);
+          setContentView(R.layout.activity_main);
+          ButterKnife.bind(this);
+          req.setOnClickListener(new View.OnClickListener() {
+              @Override
+              public void onClick(View view) {
+                  Retrofit retrofit = new Retrofit.Builder()
+                      .baseUrl("https://www.baidu.com/")
+                      .addConverterFactory(GsonConverterFactory.create())
+                      .build();
+                  MockHttpInterface request = retrofit.create(MockHttpInterface.class);
+                  String
+                      body =
+                      EncryptUtil
+                          .encryptDataWithKey("{\"testkey\":\"testvalue\"}", "chenxuesong11111");
+                  Call<String>
+                      call =
+                      request.mockHttpRequest(body);
+                  call.enqueue(new Callback<String>() {
+                      @Override
+                      public void onResponse(Call<String> call, Response<String> response) {
+                          String rsp = response.body();
+                          Log.d(TAG, rsp);
+                      }
+
+                      @Override
+                      public void onFailure(Call<String> call, Throwable t) {
+                          t.printStackTrace();
+                      }
+                  });
+              }
+          });
+      }
+  }
+#+end_src
+加密函数直接采用aes加密，使用默认配置。
+#+begin_src java
+  public static String encryptDataWithKey(String data, String key) {
+      String result = "";
+      try {
+          SecretKeySpec sp = new SecretKeySpec(key.getBytes(), "AES");
+          Cipher cp = Cipher.getInstance("AES");
+          cp.init(Cipher.ENCRYPT_MODE, sp);
+          result = bytes2HexString(cp.doFinal(data.getBytes()));
+      } catch (Exception e) {
+          e.printStackTrace();
+      } finally {
+          return result;
+      }
+  }
+#+end_src
+* 解决方法
+原理很简单，直接hook加密函数，获取参数内容。然后把参数内容交给burp做修改即可。
+  #+begin_src ditaa :exports none
+                                   +------------------+                                                                       +--------------------+
+                                   |                  |                                                                       |                    |
+                                   |     MockApk      |                                                                       |    HTTP SERVER     |
+                                   |                  |                                                            +---------->   数据直接原样返回 |
+                                   +------------------+                                                            |          |                    |
+                                   |     加密函数     <----------------+                                           |          +--------------------+
+                                   +--------^---------+                |                                           |
+                                            |                          |   Hook加密函数                            |
+                                            |                          |   使用beforeHookedMethod                  |
+                                            |                          |   在加密之前获取明文数据                  |
+                                            |                          |                                           |
+                                            |                          |                                           |
+                                            |                +---------+---------+                        +--------+---------+
+                                            |                |                   +------------------------>                  |
+                                            |                |    Xposed插件     |                        |       Burp       |
+                                            +----------------+                   <------------------------+                  |
+                                                             +-------------------+                        +------------------+
+
+                                                             在Xposed插件中，新起线程访问HTTP SERVER，并添加代理
+                                                             直接在Burp中修改明文数据，然后HTTP SERVER负责将修改
+                                                             过的数据返回给MockApk中的加密函数进行加密，并完成后
+                                                             续与服务器的交互过程。
+  #+end_src
+[[file:images/xposed-burp.png]]
+
+* 配套方案开发
+*** HTTP SERVER
+HTTP SERVER使用java开发，使用java内置的 *com.sun.net.httpserver* ，实现直接转发request body的目的。具体的处理逻辑在 *ApiTestForwardHandler* 中实现。
+#+begin_src java
+  package com.xwapi.test;
+
+  import com.alibaba.fastjson.JSON;
+  import com.sun.net.httpserver.HttpExchange;
+  import com.sun.net.httpserver.HttpHandler;
+
+  import java.io.IOException;
+  import java.io.InputStream;
+  import java.io.OutputStream;
+  import java.util.Map;
+
+  /**
+   ,* Created by chenxuesong on 19/12/14.
+   ,*/
+  public class ApiTestForwardHandler implements HttpHandler {
+
+      @Override
+      public void handle(HttpExchange httpExchange) throws IOException {
+          String response = "hello world";
+          httpExchange.sendResponseHeaders(200, 0);
+          InputStream is = httpExchange.getRequestBody();
+          String url = httpExchange.getRequestURI().toString();
+          byte[] bytes = new byte[is.available()];
+          is.read(bytes);
+          String str = new String(bytes);
+          System.out.println("read post body " + str);
+          try {
+              Map maps = (Map) JSON.parse(str);
+              for (Object map : maps.entrySet()) {
+                  System.out
+                      .println("key: " + ((Map.Entry) map).getKey() + "     value: " + ((Map.Entry) map).getValue());
+              }
+              response = JSON.toJSONString(maps);
+          } catch (Exception e) {
+              e.printStackTrace();
+          }
+          OutputStream os = httpExchange.getResponseBody();
+          os.write(response.getBytes());
+          os.close();
+
+      }
+  }
+#+end_src
+HTTP SERVER启动则在 *CustomHttpServer* 中实现。
+#+begin_src java
+  public class CustomHttpServer {
+
+      private HttpServer mServer;
+
+      public CustomHttpServer(int port) {
+          try {
+              mServer = HttpServer.create(new InetSocketAddress(port), 0);
+          } catch (IOException e) {
+              e.printStackTrace();
+          }
+      }
+
+      public void setHandler(String path, HttpHandler handler) {
+          mServer.createContext(path, handler);
+      }
+
+      public void startForward() {
+          mServer.start();
+      }
+
+  }
+#+end_src
+main函数中直接启动httpserver，并监听 *8088* 端口。
+#+begin_src java
+  package com.xwapi.test;
+
+  public class Main {
+
+      public static void main(String[] args) {
+    // write your code here
+          CustomHttpServer httpServer = new CustomHttpServer(8088);
+          httpServer.setHandler("/apiforward", new ApiTestForwardHandler());
+          httpServer.startForward();
+      }
+  }
+#+end_src
+*** XposedDecode插件
+编写插件Hook *com.flysands.mockapp.EncryptUtil* 类中的 *encryptDataWithKey* 函数，重写 *beforeHookedMethod* 函数，获取加密之前的原始数据。然后在新线程中将原始数据发送至http server地址 *http://172.20.10.4:8088/apiforward* ，并指定代理为Burp监听地址和端口（172.20.10.4:8080）。
+#+begin_src java
+  package com.flysands.xposeddecode;
+
+  import de.robv.android.xposed.IXposedHookLoadPackage;
+  import de.robv.android.xposed.XC_MethodHook;
+  import de.robv.android.xposed.XposedBridge;
+  import de.robv.android.xposed.XposedHelpers;
+  import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+  import java.io.ByteArrayOutputStream;
+  import java.io.InputStream;
+  import java.net.HttpURLConnection;
+  import java.net.InetSocketAddress;
+  import java.net.Proxy;
+  import java.net.URL;
+
+  /**
+   ,* Created by chenxuesong on 2019/12/31.
+   ,*/
+
+  public class ModuleDecode implements IXposedHookLoadPackage {
+
+      @Override
+      public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+          if (lpparam.packageName.equals("com.flysands.mockapp")) {
+              XposedBridge.log("ready to hook method.");
+              XposedHelpers.findAndHookMethod("com.flysands.mockapp.EncryptUtil", lpparam.classLoader,
+                                              "encryptDataWithKey", String.class, String.class,
+                                              new XC_MethodHook() {
+                                                  @Override
+                                                  protected void beforeHookedMethod(
+                                                      final MethodHookParam param) throws Throwable {
+                                                      super.beforeHookedMethod(param);
+                                                      final String org = (String) param.args[0];
+                                                      XposedBridge.log("org data is " + org);
+                                                      String
+                                                          forwardServer =
+                                                          "http://172.20.10.4:8088/apiforward";
+                                                      InetSocketAddress
+                                                          addr =
+                                                          new InetSocketAddress("172.20.10.4", 8080);
+                                                      final Proxy
+                                                          proxy =
+                                                          new Proxy(Proxy.Type.HTTP, addr);
+                                                      final URL url = new URL(forwardServer);
+                                                      Thread th = new Thread(new Runnable() {
+                                                          @Override
+                                                          public void run() {
+                                                              HttpURLConnection connection =
+                                                                  null;
+                                                              try {
+                                                                  connection = (HttpURLConnection) url
+                                                                      .openConnection(proxy);
+                                                                  connection.setRequestMethod("POST");
+                                                                  connection.setDoOutput(true);
+                                                                  connection.getOutputStream()
+                                                                      .write(org.getBytes());
+                                                                  int
+                                                                      responseCode =
+                                                                      connection.getResponseCode();
+                                                                  if (responseCode
+                                                                      == HttpURLConnection.HTTP_OK) {
+                                                                      InputStream
+                                                                          inputStream =
+                                                                          connection.getInputStream();
+                                                                      String
+                                                                          result =
+                                                                          readStream(inputStream);
+                                                                      XposedBridge.log(
+                                                                          "get result from server "
+                                                                          + result);
+                                                                      param.args[0] = result;
+                                                                  }
+                                                              } catch (Exception e) {
+                                                                  e.printStackTrace();
+                                                              }
+                                                          }
+                                                      });
+                                                      th.start();
+                                                      th.join();
+                                                  }
+                                              });
+          }
+      }
+
+      public static String readStream(InputStream in) throws Exception {
+          ByteArrayOutputStream baos = new ByteArrayOutputStream();
+          int len = -1;
+          byte[] buffer = new byte[1024]; //1kb
+          while ((len = in.read(buffer)) != -1) {
+
+              baos.write(buffer, 0, len);
+          }
+          in.close();
+          String content = new String(baos.toByteArray());
+
+          return content;
+
+      }
+  }
+#+end_src
+
+* 最终效果
+最终效果如图所示，原始数据 *{"testkey":"testvalue"}* 已经被我们修改为 *{"testkey":"i have modify this value"}* ，并经过加密之后发送至服务器：
+[[file:images/decode-result.png]]
